@@ -3,13 +3,21 @@ import os
 import socket
 import json
 import time
+import logging
+import netifaces
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QTextEdit, QListWidget, QPushButton, QLabel, QSplitter, 
-    QFileDialog, QMessageBox, QInputDialog, QListWidgetItem, QAction
+    QFileDialog, QMessageBox, QInputDialog, QListWidgetItem, QAction, QProgressBar
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer # Added QTimer
 # from PyQt5.QtGui import QIcon # For future use with icons
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 from gui.main_window import MainWindow as BaseMainWindow
 from network.discovery import DiscoveryService
@@ -25,27 +33,76 @@ TYPING_TIMEOUT_MS = 2000 # 2 seconds before sending "not typing"
 
 # --- Helper to get a suitable local IP ---
 def get_local_ip():
+    """Get a suitable local IP address for LAN communication."""
+    try:
+        interfaces = netifaces.interfaces()
+        for iface in interfaces:
+            # Skip loopback and virtual interfaces
+            if iface.startswith(('lo', 'docker', 'veth', 'br-', 'vnet')):
+                continue
+            addrs = netifaces.ifaddresses(iface)
+            if netifaces.AF_INET in addrs:
+                for addr in addrs[netifaces.AF_INET]:
+                    ip = addr['addr']
+                    # Skip localhost, docker, and VPN addresses
+                    if not ip.startswith(('127.', '172.', '10.')):
+                        logger = logging.getLogger(__name__)
+                        logger.info(f"Selected network interface: {iface} with IP: {ip}")
+                        return ip
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error getting network interfaces: {e}")
+        
+    # Fallback to socket method
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
-    except Exception:
-        try:
-            ip = socket.gethostbyname(socket.gethostname())
-        except socket.gaierror:
-            ip = "127.0.0.1"
+        return ip
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error getting IP via socket: {e}")
+        return "127.0.0.1"
     finally:
         s.close()
-    return ip
 
 # --- Communication signals for cross-thread GUI updates ---
 class GuiUpdater(QObject):
+    # Chat and messaging signals
     update_chat_display = pyqtSignal(str)
-    add_user_to_list = pyqtSignal(str, str)
+    update_message_status = pyqtSignal(str, str)  # message_id, status (sent/delivered/read)
+    update_typing_indicator = pyqtSignal(str)
+    
+    # User management signals
+    add_user_to_list = pyqtSignal(str, str, dict)  # username, ip, additional_info
     remove_user_from_list = pyqtSignal(str)
-    update_file_transfer_status = pyqtSignal(str, str, str)
-    prompt_user_for_file = pyqtSignal(str, object, str, str, int)
-    update_typing_indicator = pyqtSignal(str) # Signal to update typing indicator text
+    update_user_status = pyqtSignal(str, str)  # ip, status (online/away/busy)
+    
+    # File transfer signals
+    update_file_transfer_status = pyqtSignal(str, str, str, float)  # id, status, message, progress
+    update_file_transfer_speed = pyqtSignal(str, float)  # id, speed_kbps
+    update_transfer_progress = pyqtSignal(str, float, float)  # id, progress_percent, remaining_time_sec
+    prompt_user_for_file = pyqtSignal(str, object, str, str, int, dict)  # sender, peer_addr, file_id, filename, size, metadata
+    
+    # Network status signals
+    update_network_status = pyqtSignal(str, bool)  # interface, is_connected
+    update_connection_quality = pyqtSignal(str, int)  # peer_ip, latency_ms
+    update_bandwidth_usage = pyqtSignal(float, float)  # upload_kbps, download_kbps
+    update_connection_stats = pyqtSignal(str, dict)  # peer_ip, stats_dict
+    
+    # Error handling signals
+    show_error = pyqtSignal(str, str, bool)  # title, message, is_critical
+    show_warning = pyqtSignal(str, str)  # title, message
+    show_network_error = pyqtSignal(str, str, bool)  # interface, error_msg, is_critical
+    show_transfer_error = pyqtSignal(str, str, str)  # file_id, error_type, error_msg
+    
+    # Status bar signals
+    update_status_message = pyqtSignal(str, int)  # message, timeout_ms
+    clear_status_message = pyqtSignal()
+    
+    # Connection diagnostic signals
+    update_peer_diagnostics = pyqtSignal(str, dict)  # peer_ip, diagnostic_info
+    update_network_metrics = pyqtSignal(dict)  # metrics_dict with various network stats
 
 class LanMessengerApp(BaseMainWindow):
     def __init__(self, username, local_ip):
@@ -102,13 +159,39 @@ class LanMessengerApp(BaseMainWindow):
         self.discovery_service.on_user_lost = self.handle_user_lost
 
     def _connect_signals_and_actions(self):
+        # Connect basic GUI update signals
         self.gui_updater.update_chat_display.connect(self.append_to_chat_display)
         self.gui_updater.add_user_to_list.connect(self.add_user_gui)
         self.gui_updater.remove_user_from_list.connect(self.remove_user_gui)
-        self.gui_updater.update_file_transfer_status.connect(self.update_file_transfer_gui)
-        self.gui_updater.prompt_user_for_file.connect(self.prompt_user_for_file_gui)
         self.gui_updater.update_typing_indicator.connect(self.update_typing_indicator_label)
-
+        
+        # Connect file transfer signals
+        self.gui_updater.update_file_transfer_status.connect(self.update_file_transfer_gui)
+        self.gui_updater.update_file_transfer_speed.connect(self.update_transfer_speed_gui)
+        self.gui_updater.update_transfer_progress.connect(self.update_transfer_progress_gui)
+        self.gui_updater.prompt_user_for_file.connect(self.prompt_user_for_file_gui)
+        
+        # Connect status and error signals
+        self.gui_updater.show_error.connect(self.show_error_dialog)
+        self.gui_updater.show_warning.connect(self.show_warning_dialog)
+        self.gui_updater.show_network_error.connect(self.show_network_error_gui)
+        self.gui_updater.show_transfer_error.connect(self.show_transfer_error_gui)
+        
+        # Connect network status signals
+        self.gui_updater.update_network_status.connect(self.update_network_status_gui)
+        self.gui_updater.update_connection_quality.connect(self.update_connection_quality_gui)
+        self.gui_updater.update_bandwidth_usage.connect(self.update_bandwidth_usage_gui)
+        self.gui_updater.update_connection_stats.connect(self.update_connection_stats_gui)
+        
+        # Connect diagnostic signals
+        self.gui_updater.update_peer_diagnostics.connect(self.update_peer_diagnostics_gui)
+        self.gui_updater.update_network_metrics.connect(self.update_network_metrics_gui)
+        
+        # Connect user status signals
+        self.gui_updater.update_user_status.connect(self.update_user_status_gui)
+        self.gui_updater.update_message_status.connect(self.update_message_status_gui)
+        
+        # Connect button actions
         if hasattr(self, 'send_message_button'):
             self.send_message_button.clicked.connect(self.send_message_action)
         if hasattr(self, 'attach_file_button'):
@@ -116,11 +199,15 @@ class LanMessengerApp(BaseMainWindow):
         
         self.user_list_widget.itemDoubleClicked.connect(self.initiate_connection_from_list)
         self.message_input_field.textChanged.connect(self.handle_message_input_text_changed)
-
+        
+        # Connect menu actions
         for action in self.menuBar().findChildren(QAction):
-            if action.objectName() == "settings_action": action.triggered.connect(self.open_settings_dialog)
-            elif action.objectName() == "exit_action": action.triggered.connect(self.close)
-            elif action.objectName() == "about_action": action.triggered.connect(self.show_about_dialog)
+            if action.objectName() == "settings_action": 
+                action.triggered.connect(self.open_settings_dialog)
+            elif action.objectName() == "exit_action": 
+                action.triggered.connect(self.close)
+            elif action.objectName() == "about_action": 
+                action.triggered.connect(self.show_about_dialog)
 
     def _setup_typing_indicator_logic(self):
         self.typing_timer = QTimer(self)
@@ -393,6 +480,391 @@ class LanMessengerApp(BaseMainWindow):
         if self.p2p_manager: self.p2p_manager.stop()
         self.append_to_chat_display("[System] Goodbye!")
         event.accept()
+
+    def _handle_error(self, title: str, message: str, is_critical: bool = False) -> None:
+        """Handle errors in a consistent way across the application."""
+        self.gui_updater.show_error.emit(title, message, is_critical)
+        self.append_to_chat_display(f"[Error] {message}")
+        
+    def _handle_warning(self, title: str, message: str) -> None:
+        """Handle warnings in a consistent way."""
+        self.gui_updater.show_warning.emit(title, message)
+        self.append_to_chat_display(f"[Warning] {message}")
+
+    def _update_network_status(self, interface: str, is_connected: bool) -> None:
+        """Update the network status in the GUI."""
+        self.gui_updater.update_network_status.emit(interface, is_connected)
+        status = "connected" if is_connected else "disconnected"
+        self.append_to_chat_display(f"[Network] Interface {interface} is {status}")
+
+    def _update_connection_quality(self, peer_ip: str, latency_ms: int) -> None:
+        """Update connection quality information."""
+        self.gui_updater.update_connection_quality.emit(peer_ip, latency_ms)
+        username = self.online_users.get(peer_ip, peer_ip)
+        if latency_ms > 1000:  # High latency warning
+            self._handle_warning("High Latency", 
+                f"Connection to {username} is experiencing high latency ({latency_ms}ms)")
+
+    def _update_message_status(self, message_id: str, status: str) -> None:
+        """Update message delivery/read status."""
+        self.gui_updater.update_message_status.emit(message_id, status)
+        if status == "failed":
+            self._handle_warning("Message Failed", 
+                f"Failed to deliver message (ID: {message_id[:8]}...)")
+
+    def _update_file_transfer_progress(self, file_id: str, status: str, 
+                                     message: str, progress: float = 0.0, 
+                                     speed_kbps: float = 0.0) -> None:
+        """Update file transfer progress with detailed information."""
+        self.gui_updater.update_file_transfer_status.emit(file_id, status, message, progress)
+        if speed_kbps > 0:
+            self.gui_updater.update_file_transfer_speed.emit(file_id, speed_kbps)
+        
+        # Show warnings for slow transfers
+        if status == "transferring" and speed_kbps < 50:  # Less than 50 KB/s
+            self._handle_warning("Slow Transfer", 
+                f"File transfer is running slowly ({speed_kbps:.1f} KB/s)")
+
+    def _update_user_status(self, ip_address: str, status: str) -> None:
+        """Update user online status."""
+        self.gui_updater.update_user_status.emit(ip_address, status)
+        username = self.online_users.get(ip_address, ip_address)
+        if status == "away":
+            self.append_to_chat_display(f"[Status] {username} is away")
+
+    def show_error_dialog(self, title: str, message: str, is_critical: bool = False) -> None:
+        """Show an error dialog to the user."""
+        if is_critical:
+            QMessageBox.critical(self, title, message)
+        else:
+            QMessageBox.warning(self, title, message)
+
+    def show_warning_dialog(self, title: str, message: str) -> None:
+        """Show a warning dialog to the user."""
+        QMessageBox.warning(self, title, message)
+
+    def update_network_status_gui(self, interface: str, is_connected: bool) -> None:
+        """Update network status in the status bar."""
+        if is_connected:
+            self.statusBar.showMessage(f"Connected on {interface}")
+        else:
+            self.statusBar.showMessage(f"Disconnected from {interface}", 5000)
+
+    def update_connection_quality_gui(self, peer_ip: str, latency_ms: int) -> None:
+        """Update connection quality indicator for a peer."""
+        username = self.online_users.get(peer_ip, peer_ip)
+        for i in range(self.user_list_widget.count()):
+            item = self.user_list_widget.item(i)
+            if peer_ip in item.text():
+                # Add latency info to the user list item
+                current_text = item.text().split(" [")[0]  # Remove any existing latency info
+                if latency_ms > 1000:
+                    item.setForeground(Qt.red)
+                    item.setText(f"{current_text} [High Latency: {latency_ms}ms]")
+                elif latency_ms > 500:
+                    item.setForeground(Qt.yellow)
+                    item.setText(f"{current_text} [Latency: {latency_ms}ms]")
+                else:
+                    item.setForeground(Qt.green)
+                    item.setText(current_text)
+                break
+
+    def update_transfer_speed_gui(self, file_id: str, speed_kbps: float) -> None:
+        """Update file transfer speed in the transfer area."""
+        if speed_kbps >= 1024:
+            speed_text = f"{speed_kbps/1024:.1f} MB/s"
+        else:
+            speed_text = f"{speed_kbps:.1f} KB/s"
+        self.file_transfer_area.append(f"Transfer speed for {file_id}: {speed_text}")
+
+    def update_message_status_gui(self, message_id: str, status: str) -> None:
+        """Update message status in the chat display."""
+        status_text = {
+            "sent": "✓",
+            "delivered": "✓✓",
+            "read": "✓✓✓",
+            "failed": "❌"
+        }.get(status, "")
+        if status_text:
+            # Find the message in chat display and update its status
+            chat_text = self.chat_display_area.toPlainText()
+            if f"(ID: {message_id[:8]}...)" in chat_text:
+                lines = chat_text.split("\n")
+                for i, line in enumerate(lines):
+                    if f"(ID: {message_id[:8]}...)" in line:
+                        if "] " in line:  # Has existing status
+                            lines[i] = line.split("] ")[0] + f"] {status_text} " + line.split("] ")[-1]
+                        else:
+                            lines[i] = f"{line} [{status_text}]"
+                        break
+                self.chat_display_area.setPlainText("\n".join(lines))
+
+    def update_transfer_progress_gui(self, file_id: str, progress_percent: float, remaining_time_sec: float) -> None:
+        """Update detailed file transfer progress in the transfer area."""
+        if remaining_time_sec > 60:
+            time_str = f"{remaining_time_sec/60:.1f} minutes remaining"
+        else:
+            time_str = f"{remaining_time_sec:.0f} seconds remaining"
+        
+        self.file_transfer_area.append(
+            f"Transfer {file_id}: {progress_percent:.1f}% complete - {time_str}")
+        
+        # Update progress bar if it exists for this transfer
+        progress_bar = self.findChild(QProgressBar, f"progress_{file_id}")
+        if progress_bar:
+            progress_bar.setValue(int(progress_percent))
+            progress_bar.setFormat(f"{progress_percent:.1f}% - {time_str}")
+
+    def update_bandwidth_usage_gui(self, upload_kbps: float, download_kbps: float) -> None:
+        """Update bandwidth usage indicators."""
+        up_text = f"{upload_kbps/1024:.1f} MB/s" if upload_kbps >= 1024 else f"{upload_kbps:.1f} KB/s"
+        down_text = f"{download_kbps/1024:.1f} MB/s" if download_kbps >= 1024 else f"{download_kbps:.1f} KB/s"
+        self.statusBar().showMessage(f"↑ {up_text} | ↓ {down_text}")
+
+    def update_connection_stats_gui(self, peer_ip: str, stats: dict) -> None:
+        """Update detailed connection statistics for a peer."""
+        username = self.online_users.get(peer_ip, peer_ip)
+        stats_text = []
+        
+        if 'latency' in stats:
+            latency = stats['latency']
+            color = Qt.green if latency < 100 else Qt.yellow if latency < 500 else Qt.red
+            stats_text.append(f"Latency: {latency}ms")
+        
+        if 'packet_loss' in stats:
+            packet_loss = stats['packet_loss']
+            if packet_loss > 0:
+                stats_text.append(f"Packet Loss: {packet_loss:.1f}%")
+        
+        if 'bandwidth' in stats:
+            bw = stats['bandwidth']
+            stats_text.append(f"Bandwidth: {bw/1024:.1f} MB/s")
+            
+        # Update user list item with connection stats
+        for i in range(self.user_list_widget.count()):
+            item = self.user_list_widget.item(i)
+            if peer_ip in item.text():
+                base_text = item.text().split(" [")[0]
+                item.setText(f"{base_text} [{' | '.join(stats_text)}]")
+                if 'latency' in stats:
+                    item.setForeground(color)
+                break
+
+    def show_network_error_gui(self, interface: str, error_msg: str, is_critical: bool) -> None:
+        """Display network-specific errors."""
+        title = "Critical Network Error" if is_critical else "Network Warning"
+        message = f"Network interface {interface} encountered an issue:\n{error_msg}"
+        
+        if is_critical:
+            QMessageBox.critical(self, title, message)
+            self.statusBar().showMessage(f"Network Error on {interface}", 5000)
+        else:
+            QMessageBox.warning(self, title, message)
+        
+        self.append_to_chat_display(f"[Network Error] {interface}: {error_msg}")
+
+    def show_transfer_error_gui(self, file_id: str, error_type: str, error_msg: str) -> None:
+        """Display file transfer specific errors."""
+        title = f"File Transfer Error: {error_type}"
+        QMessageBox.warning(self, title, f"Transfer {file_id} failed:\n{error_msg}")
+        self.file_transfer_area.append(f"[Error] Transfer {file_id}: {error_type} - {error_msg}")
+        
+        # Update any progress bars or status indicators
+        progress_bar = self.findChild(QProgressBar, f"progress_{file_id}")
+        if progress_bar:
+            progress_bar.setFormat("Transfer Failed")
+            progress_bar.setStyleSheet("QProgressBar::chunk { background-color: red; }")
+
+    def update_peer_diagnostics_gui(self, peer_ip: str, diagnostic_info: dict) -> None:
+        """Update comprehensive peer connection diagnostics."""
+        username = self.online_users.get(peer_ip, peer_ip)
+        
+        # Create or update a detailed diagnostic display
+        text = [f"Connection Diagnostics for {username} ({peer_ip}):"]
+        
+        if 'connection_uptime' in diagnostic_info:
+            uptime = diagnostic_info['connection_uptime']
+            text.append(f"Connection Uptime: {uptime:.1f} seconds")
+            
+        if 'avg_latency' in diagnostic_info:
+            avg_latency = diagnostic_info['avg_latency']
+            text.append(f"Average Latency: {avg_latency:.1f}ms")
+            
+        if 'packet_loss_rate' in diagnostic_info:
+            loss_rate = diagnostic_info['packet_loss_rate']
+            text.append(f"Packet Loss Rate: {loss_rate:.2f}%")
+            
+        if 'connection_quality' in diagnostic_info:
+            quality = diagnostic_info['connection_quality']
+            text.append(f"Connection Quality: {quality}")
+            
+        # Display in a dedicated diagnostic area or log
+        if hasattr(self, 'diagnostic_area'):
+            self.diagnostic_area.setText("\n".join(text))
+        else:
+            self.append_to_chat_display("\n".join(text))
+
+    def update_network_metrics_gui(self, metrics: dict) -> None:
+        """Update overall network performance metrics."""
+        if not hasattr(self, 'network_metrics_label'):
+            self.network_metrics_label = QLabel()
+            self.statusBar().addPermanentWidget(self.network_metrics_label)
+            
+        # Format metrics into a concise display
+        metrics_text = []
+        
+        if 'active_connections' in metrics:
+            metrics_text.append(f"Connections: {metrics['active_connections']}")
+            
+        if 'total_bandwidth' in metrics:
+            bw = metrics['total_bandwidth'] / 1024  # Convert to MB/s
+            metrics_text.append(f"Bandwidth: {bw:.1f}MB/s")
+            
+        if 'avg_network_latency' in metrics:
+            metrics_text.append(f"Avg Latency: {metrics['avg_network_latency']:.0f}ms")
+            
+        self.network_metrics_label.setText(" | ".join(metrics_text))
+
+    def update_user_status_gui(self, ip_address: str, status: str) -> None:
+        """Update user status in the user list."""
+        for i in range(self.user_list_widget.count()):
+            item = self.user_list_widget.item(i)
+            if ip_address in item.text():
+                username = self.online_users.get(ip_address, ip_address)
+                status_icon = {
+                    "online": "🟢",
+                    "away": "🟡",
+                    "busy": "🔴",
+                    "offline": "⚫"
+                }.get(status, "")
+                item.setText(f"{status_icon} {username} - {ip_address}")
+                break
+
+    def update_transfer_progress_gui(self, file_id: str, progress_percent: float, remaining_time_sec: float) -> None:
+        """Update detailed file transfer progress in the transfer area."""
+        if remaining_time_sec > 60:
+            time_str = f"{remaining_time_sec/60:.1f} minutes remaining"
+        else:
+            time_str = f"{remaining_time_sec:.0f} seconds remaining"
+        
+        self.file_transfer_area.append(
+            f"Transfer {file_id}: {progress_percent:.1f}% complete - {time_str}")
+        
+        # Update progress bar if it exists for this transfer
+        progress_bar = self.findChild(QProgressBar, f"progress_{file_id}")
+        if progress_bar:
+            progress_bar.setValue(int(progress_percent))
+            progress_bar.setFormat(f"{progress_percent:.1f}% - {time_str}")
+
+    def update_bandwidth_usage_gui(self, upload_kbps: float, download_kbps: float) -> None:
+        """Update bandwidth usage indicators."""
+        up_text = f"{upload_kbps/1024:.1f} MB/s" if upload_kbps >= 1024 else f"{upload_kbps:.1f} KB/s"
+        down_text = f"{download_kbps/1024:.1f} MB/s" if download_kbps >= 1024 else f"{download_kbps:.1f} KB/s"
+        self.statusBar().showMessage(f"↑ {up_text} | ↓ {down_text}")
+
+    def update_connection_stats_gui(self, peer_ip: str, stats: dict) -> None:
+        """Update detailed connection statistics for a peer."""
+        username = self.online_users.get(peer_ip, peer_ip)
+        stats_text = []
+        
+        if 'latency' in stats:
+            latency = stats['latency']
+            color = Qt.green if latency < 100 else Qt.yellow if latency < 500 else Qt.red
+            stats_text.append(f"Latency: {latency}ms")
+        
+        if 'packet_loss' in stats:
+            packet_loss = stats['packet_loss']
+            if packet_loss > 0:
+                stats_text.append(f"Packet Loss: {packet_loss:.1f}%")
+        
+        if 'bandwidth' in stats:
+            bw = stats['bandwidth']
+            stats_text.append(f"Bandwidth: {bw/1024:.1f} MB/s")
+            
+        # Update user list item with connection stats
+        for i in range(self.user_list_widget.count()):
+            item = self.user_list_widget.item(i)
+            if peer_ip in item.text():
+                base_text = item.text().split(" [")[0]
+                item.setText(f"{base_text} [{' | '.join(stats_text)}]")
+                if 'latency' in stats:
+                    item.setForeground(color)
+                break
+
+    def show_network_error_gui(self, interface: str, error_msg: str, is_critical: bool) -> None:
+        """Display network-specific errors."""
+        title = "Critical Network Error" if is_critical else "Network Warning"
+        message = f"Network interface {interface} encountered an issue:\n{error_msg}"
+        
+        if is_critical:
+            QMessageBox.critical(self, title, message)
+            self.statusBar().showMessage(f"Network Error on {interface}", 5000)
+        else:
+            QMessageBox.warning(self, title, message)
+        
+        self.append_to_chat_display(f"[Network Error] {interface}: {error_msg}")
+
+    def show_transfer_error_gui(self, file_id: str, error_type: str, error_msg: str) -> None:
+        """Display file transfer specific errors."""
+        title = f"File Transfer Error: {error_type}"
+        QMessageBox.warning(self, title, f"Transfer {file_id} failed:\n{error_msg}")
+        self.file_transfer_area.append(f"[Error] Transfer {file_id}: {error_type} - {error_msg}")
+        
+        # Update any progress bars or status indicators
+        progress_bar = self.findChild(QProgressBar, f"progress_{file_id}")
+        if progress_bar:
+            progress_bar.setFormat("Transfer Failed")
+            progress_bar.setStyleSheet("QProgressBar::chunk { background-color: red; }")
+
+    def update_peer_diagnostics_gui(self, peer_ip: str, diagnostic_info: dict) -> None:
+        """Update comprehensive peer connection diagnostics."""
+        username = self.online_users.get(peer_ip, peer_ip)
+        
+        # Create or update a detailed diagnostic display
+        text = [f"Connection Diagnostics for {username} ({peer_ip}):"]
+        
+        if 'connection_uptime' in diagnostic_info:
+            uptime = diagnostic_info['connection_uptime']
+            text.append(f"Connection Uptime: {uptime:.1f} seconds")
+            
+        if 'avg_latency' in diagnostic_info:
+            avg_latency = diagnostic_info['avg_latency']
+            text.append(f"Average Latency: {avg_latency:.1f}ms")
+            
+        if 'packet_loss_rate' in diagnostic_info:
+            loss_rate = diagnostic_info['packet_loss_rate']
+            text.append(f"Packet Loss Rate: {loss_rate:.2f}%")
+            
+        if 'connection_quality' in diagnostic_info:
+            quality = diagnostic_info['connection_quality']
+            text.append(f"Connection Quality: {quality}")
+            
+        # Display in a dedicated diagnostic area or log
+        if hasattr(self, 'diagnostic_area'):
+            self.diagnostic_area.setText("\n".join(text))
+        else:
+            self.append_to_chat_display("\n".join(text))
+
+    def update_network_metrics_gui(self, metrics: dict) -> None:
+        """Update overall network performance metrics."""
+        if not hasattr(self, 'network_metrics_label'):
+            self.network_metrics_label = QLabel()
+            self.statusBar().addPermanentWidget(self.network_metrics_label)
+            
+        # Format metrics into a concise display
+        metrics_text = []
+        
+        if 'active_connections' in metrics:
+            metrics_text.append(f"Connections: {metrics['active_connections']}")
+            
+        if 'total_bandwidth' in metrics:
+            bw = metrics['total_bandwidth'] / 1024  # Convert to MB/s
+            metrics_text.append(f"Bandwidth: {bw:.1f}MB/s")
+            
+        if 'avg_network_latency' in metrics:
+            metrics_text.append(f"Avg Latency: {metrics['avg_network_latency']:.0f}ms")
+            
+        self.network_metrics_label.setText(" | ".join(metrics_text))
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
