@@ -11,7 +11,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("LAN Messenger and File Sharer")
         self.setGeometry(100, 100, 900, 700)  # x, y, width, height
 
-        # Main widget and layout
+        self._setup_main_layout()
+        self._setup_menu_bar()
+
+    def _setup_main_layout(self):
+        """Setup the main layout of the application."""
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
@@ -70,10 +74,10 @@ class MainWindow(QMainWindow):
         splitter.setSizes([250, 650])
         main_layout.addWidget(splitter)
 
-        self.create_menus()
         self.create_status_bar() # Add status bar
 
-    def create_menus(self):
+    def _setup_menu_bar(self):
+        """Setup the menu bar with actions."""
         menubar = self.menuBar()
         file_menu = menubar.addMenu("&File")
 

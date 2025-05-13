@@ -1,5 +1,9 @@
 import json
 import time
+import logging
+
+# Initialize logger
+logger = logging.getLogger(__name__)
 
 class ChatManager:
     def __init__(self, username, p2p_manager, gui_update_callback=None, gui_typing_status_callback=None, gui_read_receipt_callback=None):
@@ -14,6 +18,13 @@ class ChatManager:
             pass
 
     def _handle_incoming_data(self, peer_address, data):
+        """
+        Handle incoming chat data.
+
+        Args:
+            peer_address (tuple): Address of the peer sending the data.
+            data (bytes): The data received.
+        """
         try:
             message_str = data.decode("utf-8")
             message_data = json.loads(message_str)
@@ -26,7 +37,7 @@ class ChatManager:
                 timestamp = message_data.get("timestamp", time.time())
                 message_id = message_data.get("message_id") # Expecting a unique message ID
                 
-                formatted_message = f"{time.strftime("%H:%M:%S", time.localtime(timestamp))} {sender}: {content}"
+                formatted_message = f"{time.strftime('%H:%M:%S', time.localtime(timestamp))} {sender}: {content}"
                 if self.gui_update_callback:
                     # Pass message_id so GUI can track it for read receipts
                     self.gui_update_callback(formatted_message, peer_address, message_id=message_id)
@@ -44,7 +55,7 @@ class ChatManager:
                 if sender == self.username and peer_address[0] == self.p2p_manager.host_ip:
                      return
                 
-                formatted_message = f"{time.strftime("%H:%M:%S", time.localtime(timestamp))} {sender} (Group): {content}"
+                formatted_message = f"{time.strftime('%H:%M:%S', time.localtime(timestamp))} {sender} (Group): {content}"
                 if self.gui_update_callback:
                     self.gui_update_callback(formatted_message, None, message_id=message_id) # Group messages might also have IDs
                 
@@ -63,15 +74,15 @@ class ChatManager:
                 if self.gui_read_receipt_callback and original_message_id:
                     self.gui_read_receipt_callback(reader_username, sender_ip, original_message_id)
 
-        except json.JSONDecodeError:
-            print(f"[ChatManager] Received non-JSON message from {peer_address}: {data[:50]}...")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to decode JSON from {peer_address}: {e}")
         except UnicodeDecodeError:
-            print(f"[ChatManager] Received non-UTF8 message from {peer_address}")
+            logger.error(f"Received non-UTF8 message from {peer_address}")
         except Exception as e:
-            print(f"[ChatManager] Error processing incoming data from {peer_address}: {e}")
+            logger.error(f"Unexpected error handling data from {peer_address}: {e}")
 
     def _generate_message_id(self):
-        return f"msg_{self.username.replace(" ", "_")}_{int(time.time()*1000)}_{time.time_ns() % 1000}"
+        return f"msg_{self.username.replace(' ', '_')}_{int(time.time()*1000)}_{time.time_ns() % 1000}"
 
     def send_chat_message(self, recipient_address, message_content):
         if not message_content.strip():
@@ -90,7 +101,7 @@ class ChatManager:
                 return True, message_id # Return message_id for GUI to track
             return False, None
         except Exception as e:
-            print(f"[ChatManager] Error sending chat message: {e}")
+            logger.error(f"Error sending chat message: {e}")
             return False, None
 
     def send_group_chat_message(self, message_content):
@@ -117,7 +128,7 @@ class ChatManager:
                     sent_to_any = True
             
             if sent_to_any:
-                formatted_sent_message = f"{time.strftime("%H:%M:%S", time.localtime(message_data["timestamp"]))} You (Group): {message_content}"
+                formatted_sent_message = f"{time.strftime('%H:%M:%S', time.localtime(message_data['timestamp']))} You (Group): {message_content}"
                 if self.gui_update_callback:
                     # Pass message_id for self-sent group messages too, though receipts aren't for them
                     self.gui_update_callback(formatted_sent_message, None, is_self=True, message_id=message_id)
@@ -127,7 +138,7 @@ class ChatManager:
                     self.gui_update_callback("[System] Failed to send group message.", None)
                 return False, None
         except Exception as e:
-            print(f"[ChatManager] Error sending group chat message: {e}")
+            logger.error(f"Error sending group chat message: {e}")
             return False, None
 
     def send_typing_status(self, recipient_address, is_typing):
@@ -146,7 +157,7 @@ class ChatManager:
                 for peer_addr in list(self.p2p_manager.connections.keys()):
                     self.p2p_manager.send_data(peer_addr, data_bytes)
         except Exception as e:
-            print(f"[ChatManager] Error sending typing status: {e}")
+            logger.error(f"Error sending typing status: {e}")
 
     def send_read_receipt(self, recipient_address, original_message_id):
         receipt_data = {
@@ -158,9 +169,9 @@ class ChatManager:
         try:
             data_bytes = json.dumps(receipt_data).encode("utf-8")
             self.p2p_manager.send_data(recipient_address, data_bytes)
-            # print(f"[ChatManager] Sent read receipt for {original_message_id} to {recipient_address}")
+            # logger.info(f"Sent read receipt for {original_message_id} to {recipient_address}")
         except Exception as e:
-            print(f"[ChatManager] Error sending read receipt: {e}")
+            logger.error(f"Error sending read receipt: {e}")
 
 # Example Usage (Conceptual)
 if __name__ == "__main__":
@@ -171,7 +182,7 @@ if __name__ == "__main__":
         def add_connection(self, addr): self.connections[addr] = "mock_socket"
 
     def gui_update(msg, _, is_self=False, message_id=None): print(f"GUI Update: {msg} (self: {is_self}, id: {message_id})")
-    def gui_typing(usr, ip, is_typing): print(f"GUI Typing: {usr} ({ip}) is {"typing" if is_typing else "idle"}.")
+    def gui_typing(usr, ip, is_typing): print(f"GUI Typing: {usr} ({ip}) is {'typing' if is_typing else 'idle'}.")
     def gui_read(reader, ip, msg_id): print(f"GUI Read Receipt: {msg_id} read by {reader} ({ip})")
 
     mock_p2p = MockP2PManager()

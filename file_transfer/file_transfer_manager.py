@@ -2,6 +2,11 @@ import json
 import os
 import threading
 import time
+import logging
+from threading import Lock
+
+# Initialize logger
+logger = logging.getLogger(__name__)
 
 class FileTransferManager:
     def __init__(self, username, p2p_manager, gui_update_callback=None, gui_file_prompt_callback=None, default_download_path="./downloads"):
@@ -13,17 +18,26 @@ class FileTransferManager:
         self.active_transfers = {} # {(peer_address, file_id): {details}}
         self.file_id_counter = 0
         self.chunk_size = 4096 * 4 # 16KB chunks for potentially better performance
+        self.lock = Lock()  # Ensure thread safety
 
         if not os.path.exists(self.default_download_path):
             try:
                 os.makedirs(self.default_download_path)
             except OSError as e:
-                print(f"[FileTransferManager] Error creating download dir {self.default_download_path}: {e}")
+                logger.error(f"[FileTransferManager] Error creating download dir {self.default_download_path}: {e}")
                 # Fallback handled by main app if needed
 
     def _generate_file_id(self):
-        self.file_id_counter += 1
-        return f"file_{self.username.replace(" ", "_")}_{int(time.time())}_{self.file_id_counter}"
+        """Thread-safe file ID generation."""
+        with self.lock:
+            self.file_id_counter += 1
+            return f"file_{self.username.replace(' ', '_')}_{int(time.time())}_{self.file_id_counter}"
+
+    def _handle_file_transfer_error(self, error_message):
+        """Log and handle file transfer errors."""
+        logger.error(error_message)
+        if self.gui_update_callback:
+            self.gui_update_callback("Error", "File Transfer", error_message)
 
     def handle_incoming_file_data(self, peer_address, data):
         try:
@@ -43,7 +57,7 @@ class FileTransferManager:
             if self.gui_file_prompt_callback:
                 self.gui_file_prompt_callback(sender_username, peer_address, file_id, filename, filesize)
             else:
-                print(f"[FileTransfer] Auto-accepting file {filename} from {sender_username} ({peer_address}). ID: {file_id}")
+                logger.info(f"[FileTransfer] Auto-accepting file {filename} from {sender_username} ({peer_address}). ID: {file_id}")
                 self.accept_file_transfer(peer_address, file_id, filename, filesize)
         
         elif msg_type == "file_accept":
@@ -57,7 +71,7 @@ class FileTransferManager:
                 thread = threading.Thread(target=self._send_file_chunks, args=(peer_address, file_id, filepath), daemon=True)
                 thread.start()
             else:
-                print(f"[FileTransfer] Unexpected file_accept for {file_id} from {peer_address}")
+                logger.warning(f"[FileTransfer] Unexpected file_accept for {file_id} from {peer_address}")
 
         elif msg_type == "file_reject":
             if (peer_address, file_id) in self.active_transfers:
@@ -71,7 +85,7 @@ class FileTransferManager:
             if transfer_key in self.active_transfers and self.active_transfers[transfer_key]["status"] == "receiving":
                 self.active_transfers[transfer_key]["expected_chunk_size"] = chunk_size_val
             else:
-                print(f"[FileTransfer] Unexpected file_chunk_header for {file_id}")
+                logger.warning(f"[FileTransfer] Unexpected file_chunk_header for {file_id}")
 
         elif msg_type == "file_transfer_complete":
             transfer_key = (peer_address, file_id)
@@ -80,7 +94,7 @@ class FileTransferManager:
                 if transfer_info.get("file_handle"):
                     transfer_info["file_handle"].close()
                 if self.gui_update_callback:
-                    self.gui_update_callback(file_id, "completed_receive", f"File {transfer_info["filename"]} received successfully!")
+                    self.gui_update_callback(file_id, "completed_receive", f"File {transfer_info['filename']} received successfully!")
                 del self.active_transfers[transfer_key]
 
         elif msg_type == "file_transfer_error":
@@ -120,7 +134,7 @@ class FileTransferManager:
                 del active_receive_transfer["expected_chunk_size"]
 
             except Exception as e:
-                print(f"[FileTransfer] Error writing file chunk for {transfer_id_to_process}: {e}")
+                logger.error(f"[FileTransfer] Error writing file chunk for {transfer_id_to_process}: {e}")
                 self._send_transfer_error(peer_address, transfer_id_to_process, f"Error writing file: {e}")
                 active_receive_transfer["file_handle"].close()
                 if (peer_address, transfer_id_to_process) in self.active_transfers:
@@ -217,15 +231,15 @@ class FileTransferManager:
             completion_message = {"type": "file_transfer_complete", "file_id": file_id}
             self.p2p_manager.send_data(peer_address, json.dumps(completion_message).encode("utf-8"))
             if self.gui_update_callback:
-                self.gui_update_callback(file_id, "completed_send", f"File {transfer_info["filename"]} sent successfully!")
+                self.gui_update_callback(file_id, "completed_send", f"File {transfer_info['filename']} sent successfully!")
             if transfer_key in self.active_transfers: del self.active_transfers[transfer_key]
 
         except Exception as e:
-            print(f"[FileTransfer] Error sending file {file_id} to {peer_address}: {e}")
+            logger.error(f"[FileTransfer] Error sending file {file_id} to {peer_address}: {e}")
             self._send_transfer_error(peer_address, file_id, str(e))
             if transfer_key in self.active_transfers: del self.active_transfers[transfer_key]
             if self.gui_update_callback:
-                self.gui_update_callback(file_id, "error", f"Error sending {transfer_info.get("filename", "file")}: {e}")
+                self.gui_update_callback(file_id, "error", f"Error sending {transfer_info.get('filename', 'file')}: {e}")
 
     def _send_transfer_error(self, peer_address, file_id, error_message):
         error_msg_data = {"type": "file_transfer_error", "file_id": file_id, "error": error_message}
